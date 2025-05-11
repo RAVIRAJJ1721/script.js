@@ -1,0 +1,134 @@
+'use strict';
+
+const axios = require('axios');
+const fs = require('fs').promises;
+const path = require('path');
+const { spawn } = require('child_process');
+
+// Configuration
+const BASE_URL = 'https://vod3.cf.dmcdn.net/<path>/frag({i})/video/491/416/569614194_mp4_h264_aac_hd_2.ts'; // Replace <path> with actual path
+const THUMBNAIL_URL = 'https://s1.dmcdn.net/v/Xyvzo1e0FuiPnq9JO/x720'; // 720p thumbnail from JSON
+const SUBTITLE_URL = 'https://static2.dmcdn.net/static/video/491/416/569614194_subtitle_en-auto.srt?rev=0'; // Subtitle from JSON
+const TOTAL_SEGMENTS = 908; // Number of .ts segments
+const OUTPUT_DIR = path.join(__dirname, 'download');
+const TEMP_DIR = path.join(__dirname, 'temp');
+const OUTPUT_FILE = path.join(OUTPUT_DIR, 'The_First_Frost_2025_Ep_14_Eng_Sub.mp4');
+
+// Download a single file
+async function downloadFile(url, outputPath) {
+  try {
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    await fs.writeFile(outputPath, response.data);
+    console.log(`Downloaded: ${outputPath}`);
+  } catch (err) {
+    throw new Error(`Failed to download ${url}: ${err.message}`);
+  }
+}
+
+// Download all .ts segments
+async function downloadSegments() {
+  await fs.mkdir(TEMP_DIR, { recursive: true });
+  const segmentUrls = Array.from({ length: TOTAL_SEGMENTS }, (_, i) =>
+    BASE_URL.replace('{i}', i + 1)
+  );
+
+  for (let i = 0; i < segmentUrls.length; i++) {
+    const url = segmentUrls[i];
+    const outputPath = path.join(TEMP_DIR, `frag${i + 1}.ts`);
+    try {
+      await downloadFile(url, outputPath);
+    } catch (err) {
+      console.error(err);
+      throw new Error(`Failed to download segment ${i + 1}`);
+    }
+  }
+}
+
+// Download thumbnail and subtitles
+async function downloadAssets() {
+  await fs.mkdir(OUTPUT_DIR, { recursive: true });
+  const thumbnailPath = path.join(TEMP_DIR, 'thumbnail.jpg');
+  const subtitlePath = path.join(TEMP_DIR, 'subtitles.srt');
+  await downloadFile(THUMBNAIL_URL, thumbnailPath);
+  await downloadFile(SUBTITLE_URL, subtitlePath);
+  return { thumbnailPath, subtitlePath };
+}
+
+// Combine .ts segments into a single video with subtitles and thumbnail
+function combineVideo(thumbnailPath, subtitlePath, done) {
+  const segmentsList = path.join(TEMP_DIR, 'segments.txt');
+  const segmentEntries = Array.from({ length: TOTAL_SEGMENTS }, (_, i) =>
+    `file '${path.join(TEMP_DIR, `frag${i + 1}.ts`)}'`
+  ).join('\n');
+
+  // Write segments list file
+  fs.writeFile(segmentsList, segmentEntries)
+    .then(() => {
+      // ffmpeg command to combine segments, embed subtitles, and add thumbnail
+      const ffmpegArgs = [
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', segmentsList,
+        '-i', thumbnailPath, // Input thumbnail
+        '-map', '0:v', '-map', '0:a', // Map video and audio from segments
+        '-map', '1', // Map thumbnail
+        '-c:v', 'copy', // Copy video stream
+        '-c:a', 'copy', // Copy audio stream
+        '-c:s', 'mov_text', // Subtitle format for MP4
+        '-metadata:s:v:0', 'title=Video', // Video stream metadata
+        '-metadata:s:a:0', 'title=Audio', // Audio stream metadata
+        '-metadata:s:s:0', 'language=eng', // Subtitle language
+        '-disposition:v:1', 'attached_pic', // Mark thumbnail as cover art
+        '-vf', `subtitles=${subtitlePath}`, // Embed subtitles
+        OUTPUT_FILE
+      ];
+
+      console.log(`Combining ${TOTAL_SEGMENTS} segments into ${OUTPUT_FILE}`);
+      const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+
+      ffmpeg.stdout.on('data', (data) => console.log(data.toString()));
+      ffmpeg.stderr.on('data', (data) => console.error(data.toString()));
+
+      ffmpeg.on('close', (code) => {
+        if (code === 0) {
+          console.log(`Video created: ${OUTPUT_FILE}`);
+          done(null);
+        } else {
+          done(new Error(`ffmpeg failed with code ${code}`));
+        }
+      });
+    })
+    .catch((err) => done(err));
+}
+
+// Clean up temporary files
+async function cleanup() {
+  try {
+    await fs.rm(TEMP_DIR, { recursive: true, force: true });
+    console.log('Cleaned up temporary files');
+  } catch (err) {
+    console.error(`Failed to clean up: ${err.message}`);
+  }
+}
+
+// Main function
+async function main() {
+  try {
+    console.log('Starting download...');
+    await downloadSegments();
+    const { thumbnailPath, subtitlePath } = await downloadAssets();
+    await new Promise((resolve, reject) => {
+      combineVideo(thumbnailPath, subtitlePath, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    await cleanup();
+    console.log('Done!');
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+main();
